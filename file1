@@ -1,0 +1,380 @@
+"""
+Green-Product-Recommendation-Engine.py
+
+A self-contained example recommendation engine for "green" products using synthetic data.
+Features:
+ - Synthetic dataset generation (products + users + interactions)
+ - Product feature vectorization (content-based)
+ - Collaborative filtering via matrix factorization (SVD) on implicit feedback
+ - A hybrid recommender that blends content + collaborative
+ - Simple evaluation (precision@k)
+
+Dependencies: pandas, numpy, scikit-learn
+
+Run: python Green-Product-Recommendation-Engine.py
+"""
+
+import random
+import string
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.decomposition import TruncatedSVD
+
+RNG = np.random.RandomState(42)
+
+
+# ------------------------------
+# Synthetic data generation
+# ------------------------------
+
+def random_name(prefix: str = "Prod", n: int = 6) -> str:
+    return f"{prefix}-" + "".join(RNG.choice(list(string.ascii_uppercase), size=n))
+
+
+def generate_synthetic_products(n_products: int = 200) -> pd.DataFrame:
+    categories = [
+        "Home",
+        "Personal Care",
+        "Food",
+        "Cleaning",
+        "Fashion",
+        "Garden",
+        "Electronics Accessory",
+    ]
+    materials = [
+        "Recycled Plastic",
+        "Bamboo",
+        "Organic Cotton",
+        "Glass",
+        "Biodegradable Polymer",
+        "Stainless Steel",
+        "Wood",
+    ]
+    tags_pool = [
+        "zero-waste",
+        "low-carbon",
+        "plastic-free",
+        "recyclable",
+        "compostable",
+        "fair-trade",
+        "locally-made",
+        "low-water",
+    ]
+
+    records = []
+    for i in range(n_products):
+        pid = f"P{i:04d}"
+        cat = RNG.choice(categories, p=[0.2, 0.15, 0.15, 0.15, 0.15, 0.1, 0.1])
+        mat = RNG.choice(materials)
+        price = round(float(10 + RNG.rand() * 190), 2)  # $10 - $200
+        sustainability_score = round(float(RNG.beta(2, 2) * 100), 2)  # 0-100 beta distribution
+        rating = round(3.0 + RNG.rand() * 2.0, 2)
+        n_reviews = int(RNG.poisson(20))
+        tag_count = RNG.randint(1, 4)
+        tags = ",".join(RNG.choice(tags_pool, size=tag_count, replace=False))
+        name = random_name(prefix=cat.split()[0][:3].upper())
+        brand = RNG.choice(["GreenLeaf", "EcoMakers", "NatureFirst", "SustainCo", "LocalGood"])
+
+        records.append(
+            {
+                "product_id": pid,
+                "name": name,
+                "category": cat,
+                "material": mat,
+                "price": price,
+                "sustainability_score": sustainability_score,
+                "rating": rating,
+                "n_reviews": n_reviews,
+                "tags": tags,
+                "brand": brand,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def generate_synthetic_users(n_users: int = 100) -> pd.DataFrame:
+    # Users with preferences toward sustainability, price sensitivity, and favorite categories/tags
+    pref_cats = [
+        "Home",
+        "Personal Care",
+        "Food",
+        "Cleaning",
+        "Fashion",
+        "Garden",
+        "Electronics Accessory",
+    ]
+    records = []
+    for u in range(n_users):
+        uid = f"U{u:03d}"
+        sustainability_importance = round(RNG.beta(2, 1.5), 2)  # 0-1, higher -> more green preference
+        price_sensitivity = round(RNG.beta(1.5, 2.0), 2)  # higher -> cares about low price
+        favorite_category = RNG.choice(pref_cats)
+        favorite_tags = RNG.choice(
+            ["zero-waste", "plastic-free", "recyclable", "fair-trade", "locally-made", "low-water"],
+            size=RNG.randint(1, 3),
+            replace=False,
+        )
+        if isinstance(favorite_tags, np.ndarray):
+            favorite_tags = ",".join(favorite_tags)
+
+        records.append(
+            {
+                "user_id": uid,
+                "sustainability_importance": sustainability_importance,
+                "price_sensitivity": price_sensitivity,
+                "favorite_category": favorite_category,
+                "favorite_tags": favorite_tags,
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
+def generate_interactions(products: pd.DataFrame, users: pd.DataFrame, density: float = 0.05) -> pd.DataFrame:
+    # Create implicit feedback interactions (views/purchases) as a preference score
+    interactions = []
+    product_ids = products["product_id"].tolist()
+
+    for _, user in users.iterrows():
+        # number of items user interacts with
+        n_inter = max(1, int(len(product_ids) * (density + RNG.rand() * 0.05)))
+        chosen = RNG.choice(product_ids, size=n_inter, replace=False)
+        for pid in chosen:
+            prod = products[products["product_id"] == pid].iloc[0]
+            # base preference: combine sustainability alignment and category/tag affinity and random noise
+            score = 0.0
+            score += prod["sustainability_score"] / 100.0 * user["sustainability_importance"]
+            score += (1 - (prod["price"] - 10) / 190) * user["price_sensitivity"]
+            score += 0.5 * (prod["category"] == user["favorite_category"])  # category boost
+            # tag match boost
+            user_tags = set(str(user["favorite_tags"]).split(",")) if pd.notnull(user["favorite_tags"]) else set()
+            prod_tags = set(str(prod["tags"]).split(",")) if pd.notnull(prod["tags"]) else set()
+            if len(user_tags & prod_tags) > 0:
+                score += 0.4
+            # final noise
+            score += RNG.normal(scale=0.2)
+            # clamp
+            score = max(0.0, score)
+
+            interactions.append({"user_id": user["user_id"], "product_id": pid, "score": score})
+
+    return pd.DataFrame.from_records(interactions)
+
+
+# ------------------------------
+# Feature engineering & models
+# ------------------------------
+
+def build_product_feature_matrix(products: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    """
+    Returns (feature_matrix, feature_names)
+    Feature engineering includes:
+      - one-hot category
+      - one-hot material (top few)
+      - bag-of-tags
+      - scaled sustainability_score and price
+    """
+    df = products.copy()
+
+    # Category one-hot
+    cat_ohe = pd.get_dummies(df["category"], prefix="cat")
+
+    # Material one-hot (take top 6 materials, rest 'Other')
+    top_materials = df["material"].value_counts().nlargest(6).index.tolist()
+    df["material_simple"] = df["material"].apply(lambda x: x if x in top_materials else "Other")
+    mat_ohe = pd.get_dummies(df["material_simple"], prefix="mat")
+
+    # Tags bag-of-words
+    vec = CountVectorizer(token_pattern=r"[^,]+")
+    tags_matrix = vec.fit_transform(df["tags"].fillna(""))
+    tags_df = pd.DataFrame(tags_matrix.toarray(), columns=[f"tag_{t.strip()}" for t in vec.get_feature_names_out()])
+
+    # Numeric features scaled
+    scaler = MinMaxScaler()
+    num = scaler.fit_transform(df[["sustainability_score", "price"]])
+    num_df = pd.DataFrame(num, columns=["sustainability_scaled", "price_scaled"])
+
+    feature_df = pd.concat([cat_ohe.reset_index(drop=True), mat_ohe.reset_index(drop=True), tags_df.reset_index(drop=True), num_df.reset_index(drop=True)], axis=1)
+    feature_names = feature_df.columns.tolist()
+    feature_matrix = feature_df.values.astype(float)
+
+    return feature_matrix, feature_names
+
+
+class ContentBasedRecommender:
+    def __init__(self, products: pd.DataFrame):
+        self.products = products.reset_index(drop=True)
+        self.product_ids = self.products["product_id"].tolist()
+        self.feature_matrix, self.feature_names = build_product_feature_matrix(self.products)
+        # Precompute similarity
+        self.similarity = cosine_similarity(self.feature_matrix)
+
+    def recommend(self, liked_product_ids: List[str], top_n: int = 10, exclude_seen: List[str] = None) -> List[Tuple[str, float]]:
+        if exclude_seen is None:
+            exclude_seen = []
+        idx_map = {pid: i for i, pid in enumerate(self.product_ids)}
+        scores = np.zeros(len(self.product_ids), dtype=float)
+        for pid in liked_product_ids:
+            if pid in idx_map:
+                scores += self.similarity[idx_map[pid]]
+        # normalize
+        if len(liked_product_ids) > 0:
+            scores = scores / len(liked_product_ids)
+
+        # mask seen
+        mask = np.array([1 if pid not in exclude_seen else 0 for pid in self.product_ids])
+        scores = scores * mask
+
+        top_idx = np.argsort(-scores)[:top_n]
+        return [(self.product_ids[i], float(scores[i])) for i in top_idx]
+
+
+class CollaborativeRecommender:
+    def __init__(self, interactions: pd.DataFrame, products: pd.DataFrame, n_factors: int = 50):
+        self.products = products.reset_index(drop=True)
+        self.product_ids = self.products["product_id"].tolist()
+        self.users = interactions["user_id"].unique().tolist()
+        self.user_ids = self.users
+        # Build user-item matrix
+        self.ui_matrix = self._build_matrix(interactions)
+        # SVD for collaborative filtering
+        k = min(n_factors, min(self.ui_matrix.shape) - 1)
+        if k < 2:
+            k = 2
+        self.svd = TruncatedSVD(n_components=k, random_state=42)
+        self.user_factors = self.svd.fit_transform(self.ui_matrix)
+        self.item_factors = self.svd.components_.T
+
+    def _build_matrix(self, interactions: pd.DataFrame) -> np.ndarray:
+        user_map = {u: i for i, u in enumerate(self.users)}
+        item_map = {p: i for i, p in enumerate(self.products["product_id"].tolist())}
+        mat = np.zeros((len(self.users), len(item_map)), dtype=float)
+        for _, row in interactions.iterrows():
+            u = row["user_id"]
+            p = row["product_id"]
+            if u in user_map and p in item_map:
+                mat[user_map[u], item_map[p]] = row["score"]
+        return mat
+
+    def recommend(self, user_id: str, top_n: int = 10, exclude_seen: List[str] = None) -> List[Tuple[str, float]]:
+        if exclude_seen is None:
+            exclude_seen = []
+        if user_id not in self.users:
+            return []
+        uidx = self.users.index(user_id)
+        user_vec = self.user_factors[uidx]
+        scores = user_vec.dot(self.item_factors.T)
+        # mask seen
+        mask = np.array([1 if pid not in exclude_seen else 0 for pid in self.product_ids])
+        scores = scores * mask
+        top_idx = np.argsort(-scores)[:top_n]
+        return [(self.product_ids[i], float(scores[i])) for i in top_idx]
+
+
+class HybridRecommender:
+    def __init__(self, content_rec: ContentBasedRecommender, collab_rec: CollaborativeRecommender, alpha: float = 0.6):
+        self.content_rec = content_rec
+        self.collab_rec = collab_rec
+        self.alpha = alpha  # weight for collaborative component
+
+    def recommend_for_user(self, user_id: str, interactions: pd.DataFrame, top_n: int = 10) -> List[Tuple[str, float]]:
+        # Get user's liked products from interactions
+        seen = interactions[interactions["user_id"] == user_id]["product_id"].tolist()
+        # Collaborative scores
+        collab_scores = dict(self.collab_rec.recommend(user_id, top_n=500, exclude_seen=[]))
+        # Content-based scores using seen items
+        content_scores = dict(self.content_rec.recommend(seen, top_n=500, exclude_seen=[]))
+
+        # Merge scores
+        all_pids = set(list(collab_scores.keys()) + list(content_scores.keys()))
+        merged = []
+        for pid in all_pids:
+            c = content_scores.get(pid, 0.0)
+            s = collab_scores.get(pid, 0.0)
+            score = self.alpha * s + (1 - self.alpha) * c
+            if pid not in seen:
+                merged.append((pid, score))
+        merged_sorted = sorted(merged, key=lambda x: -x[1])[:top_n]
+        return merged_sorted
+
+
+# ------------------------------
+# Evaluation
+# ------------------------------
+
+def precision_at_k(recommended: List[str], relevant: List[str], k: int) -> float:
+    if k == 0:
+        return 0.0
+    recommended_k = recommended[:k]
+    hits = sum([1 for r in recommended_k if r in relevant])
+    return hits / k
+
+
+# ------------------------------
+# Demo / main
+# ------------------------------
+
+def main():
+    print("Generating synthetic data...")
+    products = generate_synthetic_products(300)
+    users = generate_synthetic_users(120)
+    interactions = generate_interactions(products, users, density=0.06)
+
+    print(f"Products: {len(products)}, Users: {len(users)}, Interactions: {len(interactions)}")
+
+    print("Building recommenders...")
+    content_rec = ContentBasedRecommender(products)
+    collab_rec = CollaborativeRecommender(interactions, products, n_factors=30)
+    hybrid = HybridRecommender(content_rec, collab_rec, alpha=0.7)
+
+    # Pick a random user to show recommendations
+    test_user = users.sample(1, random_state=42).iloc[0]
+    uid = test_user["user_id"]
+    print(f"\nSample user: {uid}")
+
+    user_seen = interactions[interactions["user_id"] == uid]["product_id"].tolist()
+    print(f"User has interacted with {len(user_seen)} items. Showing top recommendations...\n")
+
+    recs = hybrid.recommend_for_user(uid, interactions, top_n=10)
+    rec_df = pd.DataFrame(recs, columns=["product_id", "score"]).merge(products, on="product_id")
+
+    print(rec_df[["product_id", "name", "category", "price", "sustainability_score", "score"]].to_string(index=False))
+
+    # Quick evaluation: sample 10 users, compute precision@5
+    sample_users = RNG.choice(users["user_id"].tolist(), size=10, replace=False)
+    precisions = []
+    for u in sample_users:
+        # pretend last 2 interactions are held out
+        u_inter = interactions[interactions["user_id"] == u].sort_values("score", ascending=False).reset_index(drop=True)
+        if len(u_inter) < 3:
+            continue
+        train = u_inter[:-2]
+        test = u_inter[-2:]
+        # build quick collaborative recommender on train only
+        collab_train = CollaborativeRecommender(train, products, n_factors=20)
+        content_rec_local = ContentBasedRecommender(products)
+        hybrid_local = HybridRecommender(content_rec_local, collab_train, alpha=0.7)
+        recs_local = hybrid_local.recommend_for_user(u, train, top_n=5)
+        rec_ids = [r[0] for r in recs_local]
+        relevant = test["product_id"].tolist()
+        p5 = precision_at_k(rec_ids, relevant, 5)
+        precisions.append(p5)
+
+    if len(precisions) > 0:
+        print(f"\nMean precision@5 over sample users: {np.mean(precisions):.3f}")
+    else:
+        print("Not enough data for evaluation sample.")
+
+    # Save sample outputs
+    products.head(10).to_csv("sample_products.csv", index=False)
+    interactions.head(50).to_csv("sample_interactions.csv", index=False)
+    print("Sample CSVs written: sample_products.csv, sample_interactions.csv")
+
+
+if __name__ == "__main__":
+    main()
